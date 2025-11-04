@@ -1,0 +1,189 @@
+#include <Arduino.h>
+#include <ESP32SPISlave.h>
+#include "Wire.h"
+#include <LiquidCrystal.h>
+
+// Pines LCD 16x2 (Modo 4 bits)
+const int rs = 15, en = 2, d4 = 4, d5 = 16, d6 = 17, d7 = 26;
+LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
+
+// Pines donde están conectados los LEDs
+#define Led1 13 // Verde
+#define Led2 12 // Amarillo
+#define Led3 14 // Rojo
+
+// Pin del potenciómetro
+#define pot 34
+
+// Configuración SPI
+ESP32SPISlave slave;
+
+// Configuración del I2C
+#define I2C_DEV_ADDR 0x55
+
+// Pines para la comunicación SPI
+const int VSPI_MISO = 19;
+const int VSPI_MOSI = 23;
+const int VSPI_SCLK = 18;
+const int VSPI_SS = 5;
+
+static constexpr uint32_t BUFFER_SIZE {32};
+uint8_t spi_slave_tx_buf[BUFFER_SIZE]; // Transmite datos por SPI
+uint8_t spi_slave_rx_buf[BUFFER_SIZE]; // Recibe datos por SPI
+
+// Variables de control
+char cmd;
+char unimil, cen, dec, uni;
+
+// Variables Globales para la LCD
+unsigned int g_last_pot_bits = 0;   // Último valor del potenciómetro en bits
+char g_last_led_initial = '-';      // Última inicial del LED ('V', 'A', 'R')
+unsigned long g_last_lcd_update = 0; // Para el temporizador de la LCD
+const long g_lcd_interval = 500;     // Actualizar la LCD cada 500 ms
+
+// Prototipo de función
+int tiempo(char numero);
+void onRequest(); // Callback en comunicación I2C
+void onReceive(int len); // Callback en comunicación I2C
+void updateLCD();
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000); // Tiempo para estabilizar la comunicación
+
+  // Inicializar la LCD 16x2
+  lcd.begin(16, 2);
+  lcd.print("Proyecto 2");
+  lcd.setCursor(0, 1);
+  lcd.print("Iniciando...");
+  delay(1000); // Espera para que se lea el mensaje
+
+  // Inicializa SPI en modo esclavo
+  slave.setDataMode(SPI_MODE0);
+  slave.setQueueSize(1);
+  slave.begin(VSPI);
+
+  Serial.setDebugOutput(true);
+  Wire.onReceive(onReceive);
+  Wire.onRequest(onRequest);
+  Wire.begin((uint8_t)I2C_DEV_ADDR); // Inicializa el I2C como esclavo
+
+  // Configura los pines (salidas o entradas)
+  pinMode(Led1, OUTPUT);
+  pinMode(Led2, OUTPUT);
+  pinMode(Led3, OUTPUT);
+  pinMode(pot, INPUT);
+
+  // Limpia los buffers de SPI
+  memset(spi_slave_tx_buf, 0, BUFFER_SIZE);
+  memset(spi_slave_rx_buf, 0, BUFFER_SIZE);
+}
+
+void loop() {
+  // Manejador SPI (LEDs)
+  // Espera a que se reciba datos por SPI
+  slave.wait(spi_slave_rx_buf, spi_slave_tx_buf, BUFFER_SIZE);
+  
+  // Verifica si hay datos disponibles
+  if (slave.available()) {
+    // Lee el comando y los valores
+    cmd = spi_slave_rx_buf[0];
+    unimil = spi_slave_rx_buf[2];
+    cen = spi_slave_rx_buf[3];
+    dec = spi_slave_rx_buf[4];
+    uni = spi_slave_rx_buf[5];
+
+    // Convierte los valores de ASCII a enteros
+    int tiempoTotal = (tiempo(unimil) * 1000) + (tiempo(cen) * 100) + (tiempo(dec) * 10) + tiempo(uni);
+    
+    Serial.printf("Encendiendo LED %d por %d ms\n", cmd - '0', tiempoTotal);
+
+    // Enciende el LED correspondiente y espera el tiempo especificado
+    switch (cmd) {
+      case '1':
+        g_last_led_initial = 'V'; // Actualiza la inicial (Verde)
+        digitalWrite(Led1, HIGH);
+        delay(tiempoTotal);
+        digitalWrite(Led1, LOW);
+        break;
+      case '2':
+        g_last_led_initial = 'A'; // Actualiza la inicial (Amarillo)
+        digitalWrite(Led2, HIGH);
+        delay(tiempoTotal);
+        digitalWrite(Led2, LOW);
+        break;
+      case '3':
+        g_last_led_initial = 'R'; // Actualiza la inicial (Rojo)
+        digitalWrite(Led3, HIGH);
+        delay(tiempoTotal);
+        digitalWrite(Led3, LOW);
+        break;
+    }
+    
+    // Aquí se envía un comando de finalización
+    spi_slave_tx_buf[0] = 0; // Indica que terminó
+    slave.pop();
+  }
+
+  // Manejador de la LCD (Actualización por tiempo)
+  // Revisa si ha pasado el tiempo para actualizar la LCD
+  // Esto permite que la LCD se actualice "simultáneamente"
+  if (millis() - g_last_lcd_update > g_lcd_interval) {
+    g_last_lcd_update = millis();
+    updateLCD(); // Llama a la función que dibuja en la LCD
+  }
+}
+
+// Esta función se encarga de dibujar todo en la LCD
+void updateLCD() {
+  // Línea 0: Valor del Potenciómetro en Voltios
+  lcd.setCursor(0, 0);
+  lcd.print("Pot V: ");
+  // Convierte el valor de 12 bits (0-4095) a voltios (0-3.3V)
+  float pot_volts = (g_last_pot_bits / 4095.0) * 3.3; 
+  lcd.print(pot_volts, 2); // Imprime el float con 2 decimales
+  lcd.print("V  "); // Espacios para borrar caracteres antiguos si el valor cambia
+
+  // Línea 1: Valor en Bits y Último LED
+  lcd.setCursor(0, 1);
+  lcd.print("Bits: ");
+  lcd.print(g_last_pot_bits);
+  lcd.print("    "); // Espacios para borrar
+
+  lcd.setCursor(12, 1); // Mueve a la esquina derecha
+  lcd.print("LED:");
+  lcd.print(g_last_led_initial);
+}
+
+
+// Función para convertir ASCII a número entero
+int tiempo(char numero) {
+  return numero - '0'; // Convierte el carácter ASCII al valor numérico
+}
+
+// Manejador I2C (Potenciómetro)
+void onRequest() {
+    // Lee el valor analógico del potenciómetro (0 - 4095)
+    unsigned int valorPot = analogRead(pot);  
+    
+    g_last_pot_bits = valorPot; // Guarda el valor para la LCD
+
+    // Crear un buffer de 5 caracteres para 4 dígitos más el terminador nulo
+    char buffer[5];  
+    snprintf(buffer, sizeof(buffer), "%04u", valorPot);  // Formatear con 4 dígitos (rellenando con ceros)
+
+    // Enviar la cadena por I2C (cast explícito a uint8_t*)
+    Wire.write((const uint8_t*)buffer, 4);  
+
+    // Imprimir el valor en el monitor serial para depuración
+    Serial.print("onRequest: ");
+    Serial.println(buffer);
+}
+
+void onReceive(int len){
+  Serial.printf("onReceive[%d]:",len);
+  while(Wire.available()){
+    uint8_t incomingByte=Wire.read();
+    Serial.write(incomingByte);
+  }
+}
